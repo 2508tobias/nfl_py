@@ -1,0 +1,18 @@
+[Unit]
+Description=NFL e-paper scoreboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# gpiozero/lgpio access GPIO via the `gpio` group, not raw memory, so
+# root generally isn't needed here (unlike the old wiringpi driver).
+# Change User=root if you hit a permissions error opening the GPIO chip.
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/nfl_epaper.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
