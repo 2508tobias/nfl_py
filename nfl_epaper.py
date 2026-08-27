@@ -35,6 +35,7 @@ import sys
 import time
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 import numpy as np
@@ -60,8 +61,13 @@ REFRESH_SECONDS = 60  # how often to pull new scores and redraw
 # of hanging forever, and the main loop below catches it and falls back to a
 # full refresh for that cycle - so it's safe to try this again and actually
 # see what happens instead of guessing.
-USE_PARTIAL_REFRESH = True
+USE_PARTIAL_REFRESH = False
 FULL_REFRESH_EVERY_N_CYCLES = 30  # ~30 min at REFRESH_SECONDS=60
+
+# Display all times in CET/CEST regardless of what timezone the Pi's system
+# clock is set to, or what timezone ESPN's own pre-formatted strings use.
+# ZoneInfo handles the CET<->CEST daylight-saving switch automatically.
+DISPLAY_TZ = ZoneInfo("Europe/Berlin")
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -133,6 +139,7 @@ def fetch_games():
             games.append({
                 "state": state,
                 "detail": detail,
+                "start_utc": event.get("date"),  # ISO 8601 UTC, e.g. "2026-09-08T00:20Z"
                 "home_abbr": home["team"].get("abbreviation", "?"),
                 "away_abbr": away["team"].get("abbreviation", "?"),
                 "home_score": home.get("score", "0"),
@@ -149,11 +156,29 @@ def fetch_games():
 # ---------------------------------------------------------------------------
 
 def draw_header(draw):
-    now = datetime.now().strftime("%a %b %d  %I:%M %p")
+    now = datetime.now(DISPLAY_TZ).strftime("%a %b %d  %H:%M %Z")
     draw.text((10, 8), "NFL Scores", font=FONT_HEADER, fill=0)
     w = draw.textlength(now, font=FONT_STATUS)
     draw.text((WIDTH - w - 10, 14), now, font=FONT_STATUS, fill=0)
     draw.line((0, HEADER_H, WIDTH, HEADER_H), fill=0, width=2)
+
+
+def format_status(game):
+    """
+    For games that haven't started, build our own CET/CEST-formatted time
+    from ESPN's raw UTC start timestamp instead of using their pre-formatted
+    (US-timezone) shortDetail string. For live/finished games there's no
+    wall-clock time to convert (it's a quarter+clock or "Final"), so we just
+    use ESPN's detail text as-is.
+    """
+    if game["state"] == "pre" and game.get("start_utc"):
+        try:
+            start_dt = datetime.fromisoformat(game["start_utc"].replace("Z", "+00:00"))
+            local_dt = start_dt.astimezone(DISPLAY_TZ)
+            return local_dt.strftime("%a %H:%M")
+        except ValueError:
+            pass  # fall through to ESPN's own text if the timestamp is malformed
+    return game["detail"]
 
 
 def draw_game_cell(draw, x, y, game):
@@ -177,7 +202,7 @@ def draw_game_cell(draw, x, y, game):
     draw.text((x + CELL_W - pad - sw, away_y - 2), away_score, font=FONT_SCORE, fill=0)
     draw.text((x + CELL_W - pad - sw, home_y - 2), home_score, font=FONT_SCORE, fill=0)
 
-    status = "LIVE  " + game["detail"] if live else game["detail"]
+    status = "LIVE  " + game["detail"] if live else format_status(game)
     draw.text((x + pad, y + CELL_H - 22), status, font=FONT_STATUS, fill=0)
 
 
