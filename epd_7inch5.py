@@ -1,5 +1,8 @@
 # Seengreat 7.5 Inch E-Paper Display demo
 # Author(s):Andy Li from Seengreat
+#
+# MODIFIED: chkstatus() now has a timeout instead of waiting on BUSY forever.
+# Every other method is untouched from the original gpiozero/lgpio driver.
 
 import os
 import sys
@@ -44,9 +47,24 @@ class EPD_7Inch5():
         self.dc.on()
         self.spi.writebytes([value])
         
-    def chkstatus(self):
-        while self.busy.value==1: 
-            pass
+    def chkstatus(self, timeout=5.0):
+        """
+        Wait for BUSY to clear. MODIFIED from the original (which was
+        `while self.busy.value==1: pass` with no timeout - a single stuck
+        BUSY read would hang the whole process forever with no error).
+
+        Now polls with a short sleep (so it's not spinning a full CPU core)
+        and raises TimeoutError if BUSY hasn't cleared within `timeout`
+        seconds, so a stuck panel fails loudly instead of freezing silently.
+        """
+        start = time.time()
+        while self.busy.value == 1:
+            if time.time() - start > timeout:
+                raise TimeoutError(
+                    "EPD BUSY pin did not clear within %.1fs - panel may be "
+                    "in a bad state" % timeout
+                )
+            time.sleep(0.01)
 
     def reset(self):
         """reset the epd"""
