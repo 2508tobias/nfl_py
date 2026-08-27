@@ -51,6 +51,15 @@ REFRESH_SECONDS = 60  # how often to pull new scores and redraw
 # Partial refresh skips the full black-flash cycle - much less jarring once
 # a minute. Ghosting builds up over many partial refreshes though, so we
 # force a full refresh periodically to clean it up.
+# Partial refresh skips the full black-flash cycle - much less jarring once
+# a minute. Ghosting builds up over many partial refreshes though, so we
+# force a full refresh periodically to clean it up.
+#
+# NOTE: this previously hung indefinitely on the observed hardware (the old
+# chkstatus() had no timeout). epd_7inch5.py now raises TimeoutError instead
+# of hanging forever, and the main loop below catches it and falls back to a
+# full refresh for that cycle - so it's safe to try this again and actually
+# see what happens instead of guessing.
 USE_PARTIAL_REFRESH = True
 FULL_REFRESH_EVERY_N_CYCLES = 30  # ~30 min at REFRESH_SECONDS=60
 
@@ -217,18 +226,71 @@ def pack_image(image):
 # DISPLAY PUSH
 # ---------------------------------------------------------------------------
 
+# Tracks what's actually currently shown on the panel, in packed-byte form.
+# EPD_Dis_Part() as shipped never writes the "old frame" data (cmd 0x10)
+# before the "new frame" data (cmd 0x13) - the controller's internal old-
+# frame reference was going stale, which is the likely cause of partial
+# refreshes coming out gray/incomplete instead of clean black-and-white.
+# We track it ourselves here and always feed the real previous frame in.
+_last_displayed_bits = None
+
+
 def full_refresh(epd, image):
+    global _last_displayed_bits
     epd.init()
-    epd.whitescreen_all(pack_image(image))
+    bits = pack_image(image)
+    epd.whitescreen_all(bits)
+    _last_displayed_bits = bits
+
+
+def dis_part_with_old_data(epd, x_start, y_start, old_bits, new_bits, part_column, part_line):
+    """
+    Same register sequence as the vendor's EPD_Dis_Part(), but also writes
+    the real previous-frame data (cmd 0x10) before the new frame (cmd 0x13).
+    The shipped EPD_Dis_Part() skips the old-data write entirely.
+    """
+    x_end = x_start + part_line - 1
+    y_end = y_start + part_column - 1
+
+    epd.write_cmd(0x50)
+    epd.write_data(0xA9)
+    epd.write_data(0x07)
+
+    epd.write_cmd(0x91)   # enter partial mode
+    epd.write_cmd(0x90)   # resolution/window setting
+    epd.write_data(x_start // 256)
+    epd.write_data(x_start % 256)
+    epd.write_data(x_end // 256)
+    epd.write_data(x_end % 256 - 1)
+    epd.write_data(y_start // 256)
+    epd.write_data(y_start % 256)
+    epd.write_data(y_end // 256)
+    epd.write_data(y_end % 256 - 1)
+    epd.write_data(0x01)
+
+    epd.write_cmd(0x10)   # old data - the actual previous frame, not skipped
+    for b in old_bits:
+        epd.write_data(b)
+
+    epd.write_cmd(0x13)   # new data
+    for b in new_bits:
+        epd.write_data(b)
+
+    epd.update()
 
 
 def partial_refresh(epd, image):
-    # Whole-panel "partial" update: skips the flash, still redraws everything.
-    # epd.dis_partall() in the vendor driver is broken (undefined x_start/
-    # y_start) - call EPD_Dis_Part directly instead, same as their own
-    # dis_part_time() demo does under the hood.
-    epd.EPD_Dis_Part(0, 0, pack_image(image), EPD_HEIGHT, EPD_WIDTH)
+    global _last_displayed_bits
+    new_bits = pack_image(image)
+    # Fall back to treating the new frame as its own "old" reference if we
+    # somehow don't have a tracked previous frame yet (shouldn't normally
+    # happen - full_refresh() always runs first and sets this).
+    old_bits = _last_displayed_bits if _last_displayed_bits is not None else new_bits
+
+    dis_part_with_old_data(epd, 0, 0, old_bits, new_bits, EPD_HEIGHT, EPD_WIDTH)
     epd.write_cmd(0x92)  # exit partial mode, mirroring the vendor demo's pattern
+
+    _last_displayed_bits = new_bits
 
 
 # ---------------------------------------------------------------------------
@@ -257,14 +319,23 @@ def main():
                 or cycle % FULL_REFRESH_EVERY_N_CYCLES == 0
             )
 
-            if do_full:
-                full_refresh(epd, image)
+            try:
+                if do_full:
+                    full_refresh(epd, image)
+                    partial_session_active = False
+                else:
+                    if not partial_session_active:
+                        epd.init_part()  # once per session, before the first partial write
+                        partial_session_active = True
+                    partial_refresh(epd, image)
+            except TimeoutError as exc:
+                log.error("Display refresh timed out (%s) - forcing full refresh", exc)
                 partial_session_active = False
-            else:
-                if not partial_session_active:
-                    epd.init_part()  # once per session, before the first partial write
-                    partial_session_active = True
-                partial_refresh(epd, image)
+                try:
+                    full_refresh(epd, image)
+                except TimeoutError as exc2:
+                    log.error("Full-refresh fallback also timed out (%s) - "
+                              "skipping this cycle", exc2)
 
             # No deepsleep() between cycles on purpose: partial refresh relies
             # on staying initialized. Waking from deep sleep forces a full
